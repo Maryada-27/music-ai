@@ -1,0 +1,13 @@
+[project]
+name = "music-ai"
+version = "0.0.1"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "numpy>=1.26,<3",
+  "pretty_midi==0.2.10",
+  "matplotlib>=3.8,<4",
+  "jupyter>=1.1",
+  "ipykernel>=6.29",
+  "torch>=2.4",
+  "setuptools>=70,<81",
+]

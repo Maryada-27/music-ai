@@ -1,5 +1,6 @@
 music_env_3.11/
 data/
+artifacts/
 
 # Python artifacts
 __pycache__/
@@ -29,3 +30,4 @@ Thumbs.db
 venv/
 env/
 .env/
+.venv/
