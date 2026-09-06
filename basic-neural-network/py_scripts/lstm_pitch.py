@@ -12,6 +12,7 @@ import argparse
 import copy
 import math
 import pathlib
+import time
 import zipfile
 
 import numpy as np
@@ -169,6 +170,7 @@ def train(model, train_loader, val_loader, epochs, device, lr=1e-3, weight_decay
 
     for epoch in range(1, epochs + 1):
         model.train()
+        epoch_start = time.perf_counter()
         total_loss, correct, seen = 0.0, 0, 0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
@@ -182,10 +184,12 @@ def train(model, train_loader, val_loader, epochs, device, lr=1e-3, weight_decay
             correct += (logits.argmax(-1) == y).sum().item()
             seen += y.numel()
 
+        train_secs = time.perf_counter() - epoch_start
         val_loss, val_acc, val_oct = evaluate(model, val_loader, criterion, device)
-        print(f"Epoch {epoch:3d}/{epochs} | train loss {total_loss / seen:.4f} "
-              f"acc {correct / seen:.2%} | val loss {val_loss:.4f} ppl {math.exp(val_loss):.1f} "
-              f"acc {val_acc:.2%} oct {val_oct:.2%}")
+        val_secs = time.perf_counter() - epoch_start - train_secs
+        print(f"Epoch {epoch:3d}/{epochs} | TRAIN loss {total_loss / seen:.4f} "
+              f"pitch {correct / seen:.2%} | VAL loss {val_loss:.4f} ppl {math.exp(val_loss):.1f} "
+              f"pitch {val_acc:.2%} oct {val_oct:.2%} | {train_secs:.0f}s train {val_secs:.0f}s val")
 
         # ponytail: plain early stopping on val loss. Raise `patience` if the
         # curve is noisy; add dropout/weight decay only if it still overfits.
