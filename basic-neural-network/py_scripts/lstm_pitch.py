@@ -84,14 +84,16 @@ def load_pitches(years=('2018',), dest_dir: pathlib.Path = DATA_DIR) -> list:
 class NextPitchDataset(data.Dataset):
     """Sliding window over each song: SEQ_LEN pitches in, the same window shifted by one out."""
 
-    def __init__(self, songs, seq_len=SEQ_LEN):
+    def __init__(self, songs, seq_len=SEQ_LEN, stride=1):
         self.seq_len = seq_len
         self.songs = [torch.as_tensor(s, dtype=torch.long) for s in songs if len(s) > seq_len]
         # ponytail: flat numpy index instead of a list of tuples -- MAESTRO has
         # millions of windows and Python tuples cost ~60 bytes each.
-        counts = [len(s) - seq_len for s in self.songs]
-        self.song_idx = np.repeat(np.arange(len(self.songs)), counts)
-        self.starts = np.concatenate([np.arange(c) for c in counts]) if counts else np.empty(0, int)
+        # Every position is already a target, so stride-1 windows make each note
+        # a target `seq_len` times per epoch. stride=8 keeps 4x coverage at 1/8 the cost.
+        starts = [np.arange(0, len(s) - seq_len, stride) for s in self.songs]
+        self.song_idx = np.repeat(np.arange(len(self.songs)), [len(a) for a in starts])
+        self.starts = np.concatenate(starts) if starts else np.empty(0, int)
 
     def __len__(self):
         return len(self.starts)
@@ -263,6 +265,8 @@ def main():
     parser.add_argument('--num-years', type=int, default=len(ALL_YEARS),
                         help=f'how many MAESTRO years to train on, most recent first '
                              f'(1-{len(ALL_YEARS)}, default all)')
+    parser.add_argument('--stride', type=int, default=8,
+                        help='window stride; 1 = every position (8x slower, ~no gain)')
     parser.add_argument('--temp', type=float, default=1.0, help='generation temperature')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--smoke', action='store_true', help='run the synthetic self-check and exit')
@@ -282,7 +286,7 @@ def main():
     print(f"Songs -> train {len(train_songs)}, val {len(val_songs)}, test {len(test_songs)}")
 
     loader = lambda songs, shuffle: data.DataLoader(
-        NextPitchDataset(songs), batch_size=args.batch_size, shuffle=shuffle)
+        NextPitchDataset(songs, stride=args.stride), batch_size=args.batch_size, shuffle=shuffle)
     train_loader, val_loader = loader(train_songs, True), loader(val_songs, False)
 
     model = PitchLSTM().to(device)
