@@ -124,7 +124,7 @@ def split_songs(songs, seed=42, train_ratio=0.8, val_ratio=0.1):
 class PitchLSTM(nn.Module):
     """Embedding -> 2-layer LSTM -> logits over the 128 MIDI pitches."""
 
-    def __init__(self, embed_dim=64, hidden_size=512, num_layers=2, dropout=0.2):
+    def __init__(self, embed_dim=64, hidden_size=512, num_layers=2, dropout=0.1):
         super().__init__()
         self.embed = nn.Embedding(NUM_PITCHES, embed_dim)
         # ponytail: nn.LSTM applies `dropout` between layers, so it only does
@@ -144,30 +144,82 @@ class PitchLSTM(nn.Module):
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
-    """Returns (mean loss, top-1 accuracy) for the next note after the window.
+    """Returns (last-position loss, all-position loss, top-1 accuracy, octave accuracy).
 
-    Scored at the last position only -- that is the prediction generation uses,
-    and it keeps the numbers comparable to the single-target version.
+    Accuracy and the first loss are scored at the final position only -- that is
+    the prediction generate() makes, and it keeps these numbers comparable to
+    earlier runs. The all-position loss is the like-for-like partner of the
+    training loss, which averages over every position in the window.
     """
     model.eval()
-    total_loss, correct, oct_correct, seen = 0.0, 0, 0, 0
+    loss_last, loss_all, correct, oct_correct, seen, seen_all = 0.0, 0.0, 0, 0, 0, 0
     for x, y in loader:
-        x, y = x.to(device), y[:, -1].to(device)
-        logits = model(x)[:, -1]
-        pred = logits.argmax(1)
-        total_loss += criterion(logits, y).item() * len(y)
-        correct += (pred == y).sum().item()
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        loss_all += criterion(logits.reshape(-1, NUM_PITCHES), y.reshape(-1)).item() * y.numel()
+        seen_all += y.numel()
+
+        last, y_last = logits[:, -1], y[:, -1]
+        pred = last.argmax(1)
+        loss_last += criterion(last, y_last).item() * len(y_last)
+        correct += (pred == y_last).sum().item()
         # octave = pitch // 12. High octave acc with low pitch acc means the
         # pitch class (pitch % 12) is where the remaining error lives.
-        oct_correct += (pred // 12 == y // 12).sum().item()
+        oct_correct += (pred // 12 == y_last // 12).sum().item()
+        seen += len(y_last)
+    return (loss_last / max(seen, 1), loss_all / max(seen_all, 1),
+            correct / max(seen, 1), oct_correct / max(seen, 1))
+
+
+@torch.no_grad()
+def accuracy_by_position(model, loader, device, out='accuracy_by_position.png'):
+    """Top-1 accuracy at each position in the window, i.e. by amount of context.
+
+    Position 1 predicts from a single note, the last from a full window. A curve
+    still climbing at the end means SEQ_LEN is the binding constraint and longer
+    windows will pay; a flat tail means they will not.
+    """
+    model.eval()
+    correct, seen = None, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        hits = (model(x).argmax(-1) == y).sum(0)
+        correct = hits if correct is None else correct + hits
         seen += len(y)
-    return total_loss / max(seen, 1), correct / max(seen, 1), oct_correct / max(seen, 1)
+    accs = (correct / max(seen, 1)).tolist()
+    marks = sorted({2 ** i for i in range(len(accs).bit_length())} & set(range(1, len(accs) + 1))
+                   | {len(accs)})
+    print("Accuracy by context length: " + "  ".join(f"{m}:{accs[m - 1]:.1%}" for m in marks))
+
+    # ponytail: a failed plot must not lose a finished training run, hence the
+    # broad except. Agg so it works headless on Kaggle/Colab.
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(6, 4))
+        plt.plot(range(1, len(accs) + 1), [a * 100 for a in accs], marker='o', markersize=3)
+        plt.xlabel('notes of context')
+        plt.ylabel('top-1 accuracy (%)')
+        plt.title('Next-pitch accuracy vs context length (test split)')
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Wrote {out}")
+    except Exception as exc:
+        print(f"Plot skipped: {exc}")
+    return accs
 
 
 def train(model, train_loader, val_loader, epochs, device, lr=1e-3, weight_decay=1e-5, patience=5):
     """Trains up to `epochs`, stopping once val loss stalls and restoring the best weights."""
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # ponytail: halve the LR whenever val loss stalls for 2 epochs. Paired with
+    # patience=5 below, so the LR gets two chances to rescue a plateau before
+    # training stops. Swap for CosineAnnealingLR if you want a fixed budget.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=2)
     best_loss, best_state, stale = float('inf'), None, 0
 
     for epoch in range(1, epochs + 1):
@@ -187,11 +239,13 @@ def train(model, train_loader, val_loader, epochs, device, lr=1e-3, weight_decay
             seen += y.numel()
 
         train_secs = time.perf_counter() - epoch_start
-        val_loss, val_acc, val_oct = evaluate(model, val_loader, criterion, device)
+        val_loss, val_all, val_acc, val_oct = evaluate(model, val_loader, criterion, device)
         val_secs = time.perf_counter() - epoch_start - train_secs
+        scheduler.step(val_loss)
         print(f"Epoch {epoch:3d}/{epochs} | TRAIN loss {total_loss / seen:.4f} "
               f"pitch {correct / seen:.2%} | VAL loss {val_loss:.4f} ppl {math.exp(val_loss):.1f} "
-              f"pitch {val_acc:.2%} oct {val_oct:.2%} | {train_secs:.0f}s train {val_secs:.0f}s val")
+              f"pitch {val_acc:.2%} oct {val_oct:.2%} | all-pos loss {val_all:.4f} "
+              f"lr {optimizer.param_groups[0]['lr']:.1e} | {train_secs:.0f}s train {val_secs:.0f}s val")
 
         # ponytail: plain early stopping on val loss. Raise `patience` if the
         # curve is noisy; add dropout/weight decay only if it still overfits.
@@ -249,7 +303,7 @@ def smoke_test(device):
     loader = data.DataLoader(NextPitchDataset([scale]), batch_size=128, shuffle=True)
     model = PitchLSTM().to(device)
     criterion = train(model, loader, loader, epochs=5, device=device)
-    _, acc, _ = evaluate(model, loader, criterion, device)
+    _, _, acc, _ = evaluate(model, loader, criterion, device)
     assert acc > 0.9, f"smoke test failed: accuracy {acc:.2%} on a repeating scale"
     print(f"Smoke test passed: {acc:.2%}")
 
@@ -289,15 +343,26 @@ def main():
         NextPitchDataset(songs, stride=args.stride), batch_size=args.batch_size, shuffle=shuffle)
     train_loader, val_loader = loader(train_songs, True), loader(val_songs, False)
 
+    # Context for the final perplexity: uniform over 128 pitches scores 128, and
+    # this scores what you get from the note frequencies alone, ignoring order.
+    counts = np.bincount(np.concatenate(train_songs), minlength=NUM_PITCHES)
+    probs = counts[counts > 0] / counts.sum()
+    print(f"Baselines -> uniform perplexity {NUM_PITCHES}, "
+          f"unigram perplexity {math.exp(-(probs * np.log(probs)).sum()):.1f}")
+
     model = PitchLSTM().to(device)
     criterion = train(model, train_loader, val_loader, args.epochs, device)
+    torch.save(model.state_dict(), 'pitch_lstm.pt')
+    print("Saved best weights to pitch_lstm.pt")
 
     # ponytail: the test loader is built here, after training -- on purpose.
     # Nothing above this line can read the test split.
-    test_loss, test_acc, test_oct = evaluate(model, loader(test_songs, False), criterion, device)
+    test_loader = loader(test_songs, False)
+    test_loss, test_all, test_acc, test_oct = evaluate(model, test_loader, criterion, device)
+    accuracy_by_position(model, test_loader, device)
     print(f"\n=== FINAL TEST (held out) ===\nloss {test_loss:.4f} | "
           f"perplexity {math.exp(test_loss):.1f} | pitch acc {test_acc:.2%} | "
-          f"octave acc {test_oct:.2%}")
+          f"octave acc {test_oct:.2%} | all-pos loss {test_all:.4f}")
 
     generate(model, test_songs[0][:SEQ_LEN], device, temperature=args.temp)
 
