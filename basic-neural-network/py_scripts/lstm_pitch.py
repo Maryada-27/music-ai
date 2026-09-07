@@ -124,7 +124,7 @@ def split_songs(songs, seed=42, train_ratio=0.8, val_ratio=0.1):
 class PitchLSTM(nn.Module):
     """Embedding -> 2-layer LSTM -> logits over the 128 MIDI pitches."""
 
-    def __init__(self, embed_dim=64, hidden_size=512, num_layers=2, dropout=0.1):
+    def __init__(self, embed_dim=128, hidden_size=512, num_layers=2, dropout=0.1):
         super().__init__()
         self.embed = nn.Embedding(NUM_PITCHES, embed_dim)
         # ponytail: nn.LSTM applies `dropout` between layers, so it only does
