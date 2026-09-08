@@ -160,6 +160,36 @@ class PitchLSTMProj(nn.Module):
         return self.head(out)  # (batch, seq_len, NUM_PITCHES)
 
 
+class PitchTransformer(nn.Module):
+    """Causal transformer over the same pitch sequence, sized to match PitchLSTM.
+
+    Defaults land at ~3.4M parameters so the comparison against the LSTM is about
+    architecture rather than capacity.
+    """
+
+    def __init__(self, d_model=256, nhead=4, num_layers=4, dim_feedforward=1024, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Embedding(NUM_PITCHES, d_model)
+        # Attention is permutation-invariant, so order has to be supplied explicitly.
+        self.pos = nn.Embedding(SEQ_LEN, d_model)
+        layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout,
+                                           batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers)
+        self.head = nn.Linear(d_model, NUM_PITCHES)
+
+    def forward(self, pitch_seq):
+        seq_len = pitch_seq.size(1)
+        positions = torch.arange(seq_len, device=pitch_seq.device)
+        x = self.embed(pitch_seq) + self.pos(positions)
+        # Mandatory: without the mask, position t attends to t+1, which is its
+        # own target. That leak reads as ~100% accuracy and means nothing.
+        mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=pitch_seq.device)
+        return self.head(self.encoder(x, mask=mask, is_causal=True))
+
+
+ARCHITECTURES = {'stacked': PitchLSTM, 'proj': PitchLSTMProj, 'xformer': PitchTransformer}
+
+
 # ==========================================
 # 4. TRAINING & EVALUATION
 # ==========================================
@@ -323,11 +353,11 @@ def generate(model, seed_pitches, device, num_notes=64, temperature=1.0, out='ge
 # 6. SMOKE TEST
 # ==========================================
 
-def smoke_test(device):
+def smoke_test(device, model_cls=None):
     """Trains on a repeating scale. The model must learn it near-perfectly."""
     scale = np.tile([60, 62, 64, 65, 67, 69, 71, 72], 300)
     loader = data.DataLoader(NextPitchDataset([scale]), batch_size=128, shuffle=True)
-    model = PitchLSTM().to(device)
+    model = (model_cls or PitchLSTM)().to(device)
     criterion = train(model, loader, loader, epochs=5, device=device)
     _, _, acc, _ = evaluate(model, loader, criterion, device)
     assert acc > 0.9, f"smoke test failed: accuracy {acc:.2%} on a repeating scale"
@@ -345,8 +375,9 @@ def main():
     parser.add_argument('--num-years', type=int, default=len(ALL_YEARS),
                         help=f'how many MAESTRO years to train on, most recent first '
                              f'(1-{len(ALL_YEARS)}, default all)')
-    parser.add_argument('--arch', choices=('stacked', 'proj'), default='stacked',
-                        help='stacked = 2-layer LSTM; proj = LSTM-Linear-LSTM')
+    parser.add_argument('--arch', choices=('stacked', 'proj', 'xformer'), default='stacked',
+                        help='stacked = 2-layer LSTM; proj = LSTM-Linear-LSTM; '
+                             'xformer = causal transformer')
     parser.add_argument('--stride', type=int, default=8,
                         help='window stride; 1 = every position (8x slower, ~no gain)')
     parser.add_argument('--temp', type=float, default=1.0, help='generation temperature')
@@ -356,7 +387,7 @@ def main():
 
     device = torch.device(args.device)
     if args.smoke:
-        smoke_test(device)
+        smoke_test(device, ARCHITECTURES[args.arch])
         return
 
     torch.manual_seed(42)
@@ -378,7 +409,7 @@ def main():
     print(f"Baselines -> uniform perplexity {NUM_PITCHES}, "
           f"unigram perplexity {math.exp(-(probs * np.log(probs)).sum()):.1f}")
 
-    model = (PitchLSTM() if args.arch == 'stacked' else PitchLSTMProj()).to(device)
+    model = ARCHITECTURES[args.arch]().to(device)
     print(f"Model -> {args.arch}, {sum(p.numel() for p in model.parameters()):,} params")
     criterion = train(model, train_loader, val_loader, args.epochs, device)
     torch.save(model.state_dict(), 'pitch_lstm.pt')
