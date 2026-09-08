@@ -138,6 +138,28 @@ class PitchLSTM(nn.Module):
         return self.head(out)  # (batch, seq_len, NUM_PITCHES)
 
 
+class PitchLSTMProj(nn.Module):
+    """Embedding -> LSTM -> Linear -> LSTM -> Linear. Interleaved variant of the above.
+
+    The projection is nonlinear on purpose: a plain Linear between two LSTMs gets
+    absorbed into the next layer's input weights and buys nothing but parameters.
+    """
+
+    def __init__(self, embed_dim=128, hidden_size=512, proj_size=512, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Embedding(NUM_PITCHES, embed_dim)
+        self.lstm1 = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+        self.proj = nn.Sequential(nn.Linear(hidden_size, proj_size), nn.GELU(),
+                                  nn.Dropout(dropout))
+        self.lstm2 = nn.LSTM(proj_size, hidden_size, batch_first=True)
+        self.head = nn.Linear(hidden_size, NUM_PITCHES)
+
+    def forward(self, pitch_seq):
+        out, _ = self.lstm1(self.embed(pitch_seq))
+        out, _ = self.lstm2(self.proj(out))
+        return self.head(out)  # (batch, seq_len, NUM_PITCHES)
+
+
 # ==========================================
 # 4. TRAINING & EVALUATION
 # ==========================================
@@ -323,6 +345,8 @@ def main():
     parser.add_argument('--num-years', type=int, default=len(ALL_YEARS),
                         help=f'how many MAESTRO years to train on, most recent first '
                              f'(1-{len(ALL_YEARS)}, default all)')
+    parser.add_argument('--arch', choices=('stacked', 'proj'), default='stacked',
+                        help='stacked = 2-layer LSTM; proj = LSTM-Linear-LSTM')
     parser.add_argument('--stride', type=int, default=8,
                         help='window stride; 1 = every position (8x slower, ~no gain)')
     parser.add_argument('--temp', type=float, default=1.0, help='generation temperature')
@@ -354,7 +378,8 @@ def main():
     print(f"Baselines -> uniform perplexity {NUM_PITCHES}, "
           f"unigram perplexity {math.exp(-(probs * np.log(probs)).sum()):.1f}")
 
-    model = PitchLSTM().to(device)
+    model = (PitchLSTM() if args.arch == 'stacked' else PitchLSTMProj()).to(device)
+    print(f"Model -> {args.arch}, {sum(p.numel() for p in model.parameters()):,} params")
     criterion = train(model, train_loader, val_loader, args.epochs, device)
     torch.save(model.state_dict(), 'pitch_lstm.pt')
     print("Saved best weights to pitch_lstm.pt")
