@@ -412,19 +412,22 @@ def main():
     model = ARCHITECTURES[args.arch]().to(device)
     print(f"Model -> {args.arch}, {sum(p.numel() for p in model.parameters()):,} params")
     criterion = train(model, train_loader, val_loader, args.epochs, device)
-    torch.save(model.state_dict(), 'pitch_lstm.pt')
-    print("Saved best weights to pitch_lstm.pt")
+    # ponytail: every output is named after the architecture. Runs that shared
+    # a filename have already clobbered each other's weights and logs twice.
+    torch.save(model.state_dict(), f'pitch_{args.arch}.pt')
+    print(f"Saved best weights to pitch_{args.arch}.pt")
 
     # ponytail: the test loader is built here, after training -- on purpose.
     # Nothing above this line can read the test split.
     test_loader = loader(test_songs, False)
     test_loss, test_all, test_acc, test_oct = evaluate(model, test_loader, criterion, device)
-    accuracy_by_position(model, test_loader, device)
+    accuracy_by_position(model, test_loader, device, out=f'accuracy_{args.arch}.png')
     print(f"\n=== FINAL TEST (held out) ===\nloss {test_loss:.4f} | "
           f"perplexity {math.exp(test_loss):.1f} | pitch acc {test_acc:.2%} | "
           f"octave acc {test_oct:.2%} | all-pos loss {test_all:.4f}")
 
-    generate(model, test_songs[0][:SEQ_LEN], device, temperature=args.temp)
+    generate(model, test_songs[0][:SEQ_LEN], device, temperature=args.temp,
+             out=f'generated_{args.arch}.mid')
 
 
 if __name__ == '__main__':
