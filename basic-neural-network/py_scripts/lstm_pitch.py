@@ -264,14 +264,21 @@ def accuracy_by_position(model, loader, device, out='accuracy_by_position.png'):
     return accs
 
 
-def train(model, train_loader, val_loader, epochs, device, lr=1e-3, weight_decay=1e-5,
-          patience=5):
+def train(model, train_loader, val_loader, epochs, device, lr=1e-3, patience=5,
+          optimizer_name='adam', clip_norm=1.0):
     """Trains up to `epochs`, stopping once val loss stalls and restoring the best weights."""
     # ponytail: label_smoothing=0.1 was measured and removed. It bought +0.5 top-1
     # (42.42% -> 42.90%) and cost perplexity (8.9 -> 9.0), which is the headline
     # metric here. Flattening the target necessarily raises NLL. Don't re-add it.
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Adam's weight_decay is L2 folded into the gradient, so the adaptive scaling
+    # then shrinks it for exactly the weights that need it most. AdamW decouples
+    # it, which is why it is the standard transformer optimizer. 1e-5 alongside
+    # plain Adam was close enough to no regularization at all.
+    if optimizer_name == 'adamw':
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     # ponytail: halve the LR whenever val loss stalls for 2 epochs. Paired with
     # patience=5 below, so the LR gets two chances to rescue a plateau before
     # training stops. Swap for CosineAnnealingLR if you want a fixed budget.
@@ -288,6 +295,8 @@ def train(model, train_loader, val_loader, epochs, device, lr=1e-3, weight_decay
             loss = criterion(logits.reshape(-1, NUM_PITCHES), y.reshape(-1))
             optimizer.zero_grad()
             loss.backward()
+            if optimizer_name == 'adamw':
+                nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
             optimizer.step()
 
             total_loss += loss.item() * y.numel()
@@ -375,6 +384,9 @@ def main():
     parser.add_argument('--num-years', type=int, default=len(ALL_YEARS),
                         help=f'how many MAESTRO years to train on, most recent first '
                              f'(1-{len(ALL_YEARS)}, default all)')
+    parser.add_argument('--optimizer', choices=('adam', 'adamw'), default='adam',
+                        help='adamw also enables gradient clipping and weight_decay 0.01; '
+                             'adam is the default so earlier results stay reproducible')
     parser.add_argument('--arch', choices=('stacked', 'proj', 'xformer'), default='stacked',
                         help='stacked = 2-layer LSTM; proj = LSTM-Linear-LSTM; '
                              'xformer = causal transformer')
@@ -410,24 +422,27 @@ def main():
           f"unigram perplexity {math.exp(-(probs * np.log(probs)).sum()):.1f}")
 
     model = ARCHITECTURES[args.arch]().to(device)
-    print(f"Model -> {args.arch}, {sum(p.numel() for p in model.parameters()):,} params")
-    criterion = train(model, train_loader, val_loader, args.epochs, device)
+    tag = f'{args.arch}_{args.optimizer}'
+    print(f"Model -> {args.arch}, {args.optimizer}, "
+          f"{sum(p.numel() for p in model.parameters()):,} params")
+    criterion = train(model, train_loader, val_loader, args.epochs, device,
+                      optimizer_name=args.optimizer)
     # ponytail: every output is named after the architecture. Runs that shared
     # a filename have already clobbered each other's weights and logs twice.
-    torch.save(model.state_dict(), f'pitch_{args.arch}.pt')
-    print(f"Saved best weights to pitch_{args.arch}.pt")
+    torch.save(model.state_dict(), f'pitch_{tag}.pt')
+    print(f"Saved best weights to pitch_{tag}.pt")
 
     # ponytail: the test loader is built here, after training -- on purpose.
     # Nothing above this line can read the test split.
     test_loader = loader(test_songs, False)
     test_loss, test_all, test_acc, test_oct = evaluate(model, test_loader, criterion, device)
-    accuracy_by_position(model, test_loader, device, out=f'accuracy_{args.arch}.png')
+    accuracy_by_position(model, test_loader, device, out=f'accuracy_{tag}.png')
     print(f"\n=== FINAL TEST (held out) ===\nloss {test_loss:.4f} | "
           f"perplexity {math.exp(test_loss):.1f} | pitch acc {test_acc:.2%} | "
           f"octave acc {test_oct:.2%} | all-pos loss {test_all:.4f}")
 
     generate(model, test_songs[0][:SEQ_LEN], device, temperature=args.temp,
-             out=f'generated_{args.arch}.mid')
+             out=f'generated_{tag}.mid')
 
 
 if __name__ == '__main__':
